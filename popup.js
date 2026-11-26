@@ -11,22 +11,53 @@ function fmt(t) {
   return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
 }
 
+// A tab that never answers (hibernated, frozen, still loading...) must not block
+// the whole popup, so each message gives up after a short time.
+const SEND_TIMEOUT_MS = 400;
+
 function send(tabId, msg) {
   return new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, msg, (res) => {
-      void chrome.runtime.lastError; // tab has no media / no content script
-      resolve(res && res.ok ? res : null);
-    });
+    const timer = setTimeout(() => resolve(null), SEND_TIMEOUT_MS);
+    try {
+      chrome.tabs.sendMessage(tabId, msg, (res) => {
+        void chrome.runtime.lastError; // tab has no media / no content script
+        clearTimeout(timer);
+        resolve(res && res.ok ? res : null);
+      });
+    } catch {
+      clearTimeout(timer);
+      resolve(null);
+    }
   });
 }
 
+// Which tabs belong in the popup:
+//  - tabs making sound you can hear (audible and not muted);
+//  - tabs muted from this popup (until unmuted, by the popup or the tab itself);
+//  - tabs paused from this popup (until they make sound again).
+// Tabs that are silent, or muted outside the extension, are left out.
+function shouldShow(tab, pin) {
+  const muted = !!(tab.mutedInfo && tab.mutedInfo.muted);
+  if (pin && pin.muted && muted) return true;
+  if (pin && pin.paused) return true;
+  return !!tab.audible && !muted;
+}
+
 async function collect() {
-  const tabs = await chrome.tabs.query({});
+  const [tabs, pins] = await Promise.all([chrome.tabs.query({}), Pins.getAll()]);
   const results = await Promise.all(
     tabs.map(async (tab) => {
-      if (!tab.id || !/^(https?|file):/.test(tab.url || '')) return null;
+      // Discarded (hibernated) tabs have no running page to ask.
+      if (!tab.id || tab.discarded || !/^(https?|file):/.test(tab.url || '')) return null;
+      const pin = pins[tab.id];
+      // Muted pin left over from a manual unmute the background missed: drop it.
+      if (pin && pin.muted && !(tab.mutedInfo && tab.mutedInfo.muted)) Pins.set(tab.id, 'muted', false);
+      if (!shouldShow(tab, pin)) return null;
       const info = await send(tab.id, { type: 'mc-get' });
-      return info ? { tab, info } : null;
+      if (!info) return null;
+      // Paused from the popup but playing again: back to the normal rule.
+      if (pin && pin.paused && !info.paused) Pins.set(tab.id, 'paused', false);
+      return { tab, info };
     })
   );
   // Playing media first, then the active tab, then the rest.
@@ -50,11 +81,19 @@ function createCard(tab) {
   el.querySelector('.mute').addEventListener('click', async () => {
     const t = await chrome.tabs.get(tab.id);
     const muted = !t.mutedInfo.muted;
+    // Muting here keeps the tab in the popup; unmuting releases it.
+    await Pins.set(tab.id, 'muted', muted);
     await chrome.tabs.update(tab.id, { muted });
     card.muteLockUntil = Date.now() + 700; // ignore a refresh that read the old state
     setMuted(el, muted);
   });
-  el.querySelector('.play').addEventListener('click', () => cmd('toggle'));
+  // Pausing here keeps the tab in the popup (it stops making sound), so it can be resumed.
+  el.querySelector('.play').addEventListener('click', async () => {
+    const info = await send(tab.id, { type: 'mc-cmd', token: card.token, action: 'toggle' });
+    if (!info) return;
+    await Pins.set(tab.id, 'paused', info.paused);
+    update(card, tab, info);
+  });
   el.querySelector('.skip-back').addEventListener('click', () => cmd('skip', -5));
   el.querySelector('.skip-fwd').addEventListener('click', () => cmd('skip', 5));
   el.querySelector('.prev').addEventListener('click', () => cmd('prev'));
@@ -119,7 +158,19 @@ function update(card, tab, info) {
   }
 }
 
+let refreshing = false;
 async function refresh() {
+  // The 500 ms timer must not stack up calls while a previous refresh is still waiting.
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    await doRefresh();
+  } finally {
+    refreshing = false;
+  }
+}
+
+async function doRefresh() {
   const items = await collect();
   const seen = new Set();
   // Cards keep their position once shown (pausing one must not move it);
@@ -133,8 +184,13 @@ async function refresh() {
   for (const [id, card] of cards) {
     if (!seen.has(id) && !card.dragging) { card.el.remove(); cards.delete(id); }
   }
+  empty.textContent = 'No media playing';
   empty.hidden = items.length > 0;
 }
 
+// Show something right away, so the popup never opens as an empty strip while
+// the tabs are being asked.
+empty.textContent = 'Looking for media…';
+empty.hidden = false;
 refresh();
 setInterval(refresh, 500);
